@@ -1,0 +1,8 @@
+vocab_size = 50257
+emb_dim = 768
+context_length = 1024
+n_layer = 12
+n_heads = 12
+drop_rate = 0.1
+ffn_hidden_mult = 4
+qkv_bias = False
