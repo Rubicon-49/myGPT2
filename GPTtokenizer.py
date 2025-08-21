@@ -1,8 +1,10 @@
 from torch.utils.data import Dataset
+from torch.utils.data import DataLoader
 import torch
 import tiktoken
-from typing import Union, List, Optional
+from typing import Union, List, Optional, Tuple
 import random
+import os
 
 class GPTDatasetV1(Dataset):
     """
@@ -87,3 +89,83 @@ class GPTDatasetV1(Dataset):
 
     def __getitem__(self, idx):
         return self.input_ids[idx], self.target_ids[idx]
+    
+def create_dataloader_v1(
+    txt: Union[str, List[str]],
+    *, # everything after this is a keyword-only argument
+    batch_size: int = 8, 
+    block_size: int = 1024, # GPT-2 block length
+    stride: Optional[int] = None, # default: non-overlapping == block_size
+    eot_id: int = 50256, # GPT-2 end-of-text token
+    shuffle_blocks: bool = True, # shuffle dataset blocks each epoch
+    seed: int = 42,
+    num_workers: Optional[int] = None,
+    drop_last: bool = True,
+    prefetch_factor: Optional[int] = None, # only used when num_workers > 0
+) -> Tuple[DataLoader, "GPTDatasetV1", str]:
+    """
+    Build a DataLoader for GPT-style next-token training.
+    
+    Design choices:
+    - Use tiktoken 'r50k_base' (GPT-2/3 vocab) and keep shuffling at the dataset level.
+    - Auto-detect device: CUDA if available; otherwise CPU.
+    - Enable pinned memory on CUDA for faster host-> device copies.
+    - Choose a reasonable default worker count
+    - Return (loader, dataset, device)  
+    """
+    
+    # Device detection
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Encoding: GPT-2-compatible byte-level BPE tokenizer
+    enc = tiktoken.get_encoding("r50k_base")
+    
+    # Create the dataset: single source of shuffling is here
+    dataset = GPTDatasetV1(
+        txt=txt,
+        max_length=block_size,
+        stride=stride,
+        eot_id=eot_id,
+        shuffle_blocks=shuffle_blocks,
+        seed=seed,
+    )
+    
+    # Reproducibility
+    gen = torch.Generator(device=device)
+    gen.manual_seed(seed)
+    
+    # Create a per-worker seed so that workers don't produce the same data
+    def _seed_worker(worker_id: int):
+        # Make worker RNG deterministic
+        worker_seed = seed + worker_id
+        torch.manual_seed(worker_seed)
+        
+    # Performance knobs tuned
+    # if user didn't specify num_workers, pick modest worker count
+    if num_workers is None:
+        cpu_count = os.cpu_count() or 2
+        num_workers = max(0, min(4, cpu_count // 2))
+    
+    # Enable pinned memory for faster (and asynchronous) transfers to CUDA 
+    pin_memory = (device == "cuda")
+    
+    # Avoid overhaad of terminating workers after each epoch, i.e. keep them alive
+    use_persistent = (num_workers > 0)
+    
+    # Control how many batches are prefetched ahead of training loop
+    effective_prefetch = prefetch_factor if num_workers > 0 else None
+    
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,            # dataset handles block shuffling
+        drop_last=drop_last,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=use_persistent,
+        prefetch_factor=effective_prefetch,
+        worker_init_fn=(_seed_worker if num_workers > 0 else None),
+        generator=gen,
+    )
+    
+    return loader, dataset, device
